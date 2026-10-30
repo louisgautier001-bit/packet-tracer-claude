@@ -1,0 +1,328 @@
+# MCP Tools
+
+Packet Tracer MCP exposes **96 tools**, grouped below by purpose. Tools that touch
+a running Packet Tracer require the [live bridge](live-deploy.md) to be connected.
+
+!!! tip "Discover first"
+    Call `pt_list_devices` (and `pt_list_modules` before installing expansion cards)
+    so the LLM uses real model names, ports and cables from the catalog. Most
+    NAT/ACL/module tools accept `dry_run=True` to preview the generated CLI/JS
+    without touching PT.
+
+!!! tip "Verify, then read back"
+    Every configuration tool replies `verified`, `verification` and `rejected_lines`:
+    only `verified: true` means IOS accepted every line. Then read the device back with
+    the matching reader (`pt_read_vlans`, `pt_read_acl`, `pt_read_routes`, `pt_read_qos`,
+    `pt_read_dhcp_leases`, ...). To find out *why* traffic fails, `pt_send_pdu` with
+    `steps > 0` returns PT's own per-layer reason.
+
+## Catalog & discovery
+
+| Tool | What it does |
+|------|--------------|
+| `pt_list_devices` | List all 74 device models with their exact ports + ~100 aliases. |
+| `pt_get_device_details` | Ports/details for one model (accepts a model name or alias). |
+| `pt_list_templates` | List the 9 topology templates and their defaults. |
+| `pt_list_modules` | List expansion modules; optional `router_model` / `category` filter. |
+| `pt_list_projects` | List saved projects under the exports directory. |
+
+## Planning
+
+| Tool | What it does |
+|------|--------------|
+| `pt_plan_topology` | Generate a full `TopologyPlan` (devices, links, IPs, routing, DHCP). |
+| `pt_estimate_plan` | Fast dry-run: device/link/subnet counts and complexity, no full plan. |
+| `pt_validate_plan` | Validate a plan; returns typed errors and warnings. |
+| `pt_fix_plan` | Auto-fix a plan (cables, port reassignment, model upgrades). |
+| `pt_explain_plan` | Explain the plan's design choices in natural language. |
+
+## Generation & export
+
+| Tool | What it does |
+|------|--------------|
+| `pt_generate_script` | Emit the PTBuilder JavaScript (`lwAddDevice`/`lwAddLink`/…). |
+| `pt_generate_configs` | Emit IOS CLI configs for every router and switch + host settings. |
+| `pt_export` | Write script, per-device configs and plan JSON to `projects/<name>/`. |
+| `pt_load_project` | Load a previously saved project's plan. |
+| `pt_full_build` | One-shot pipeline: plan → validate → generate → explain → (deploy). |
+| `pt_deploy` | Copy the PTBuilder script to the clipboard + export files. |
+
+## Live bridge
+
+The bridge has **two channels** and picks one per command automatically: **HTTP**
+while the MCP Control Center window is open, and a **file-bridge** (the Script
+Engine reads a mailbox under `%LOCALAPPDATA%`) when the window is closed but PT is
+still open. Every tool below works over either. See [Live deploy](live-deploy.md).
+
+| Tool | What it does |
+|------|--------------|
+| `pt_bridge_status` | Which channel is connected (HTTP, file-bridge, or both). |
+| `pt_live_deploy` | Stream a plan into a running PT (devices, links, configs). |
+| `pt_query_topology` | List devices currently in PT with ports, per-port IPs and each link's real cable type. |
+| `pt_export_topology` | Full snapshot: positions, per-interface IPs, links with the real cable type (`Link.getConnectionType()`). |
+| `pt_save_project` | Save the running topology as a real `.pkt` file (`overwrite=True` to replace one). |
+| `pt_open_project` | Open a `.pkt` in PT (replaces the current topology). Judged by `fileOpen`'s return (0 = opened) and the active file. |
+| `pt_send_raw` | Run arbitrary JS in PT's Script Engine (`wait_result` injects `reportResult`). |
+
+## Live editing
+
+| Tool | What it does |
+|------|--------------|
+| `pt_add_device` | Add one device (validates name, model, no duplicates). |
+| `pt_add_link` | Link two devices; validates ports are free; infers cable if omitted. |
+| `pt_delete_link` | Remove the link on a given interface; `verified` when both ends read back free (reports the far end and cable). |
+| `pt_delete_device` | Delete a device (via `getLogicalWorkspace().removeDevice()`). |
+| `pt_rename_device` | Rename a device; `verified` when the new name resolves and the old one is gone. |
+| `pt_move_device` | Move a device to new canvas coordinates; `verified` when PT reads back exactly (x, y). |
+| `pt_set_port` | Low-level port attributes (bandwidth, duplex, description, MAC, power). |
+| `pt_add_module` | Install one expansion module (auto power-cycle; IOS devices `write memory` first). Reports `installed`/`failed`. |
+| `pt_remove_module` | Remove the module in a slot (auto power-cycle) and report which ports disappeared. |
+| `pt_install_modules_batch` | Install several modules in one power-cycle (preferred for many). |
+
+## Device panel: CLI, Desktop and Services
+
+Everything a student does inside a device's window, done through PT's own API: no
+mouse, no keyboard, nothing taken over on screen. What you type with `pt_cli` shows
+up in the device's real CLI tab, so the user can watch or take over at any time.
+
+Headless is the default and the safe choice while you type elsewhere. With a window
+open (`show=True`, `capture=True` or `pt_ui_mode("ui")`), Windows can hand it the
+keyboard: Qt activates the dialog it opens. The server gives the foreground back to
+your window within tens of milliseconds, but keys pressed in that gap reach PT. In a
+console they join the line the API is about to send, so `int` typed by accident
+turns `enable` into `intenable`. `PT_UI_KEEP_FOCUS=0` turns the restore off. The
+GUI is Windows only: on macOS and Linux no window is ever opened, so nothing can
+take the keyboard.
+
+| Tool | Window it drives | What it does |
+|------|------------------|--------------|
+| `pt_cli` | CLI tab (router/switch) | Type IOS commands one at a time, waiting for the prompt. Each comes back `ok`, `ERROR`, `unknown command` (IOS took it as a hostname; the DNS lookup is aborted), `waiting for an answer` or `timeout`. Presses Enter on `[confirm]` and `Destination filename [..]?`; `[yes/no]` and `Password:` are answered by the next command. A freshly deployed router is primed automatically. |
+| `pt_host_command` | Desktop › Command Prompt | `ping`, `ipconfig`, `tracert`, `arp -a`, `nslookup`, `telnet`/`ssh` (answers via `inputs`). |
+| `pt_terminal` | PC Desktop › Terminal | Find the router at the other end of the PC's console cable and type on its console, as from the PC's Terminal app. |
+| `pt_host_ip_config` | Desktop › IP Configuration | Static IP or DHCP (waits for the lease), mask (`24` or dotted), gateway (read back from `HostIpProcess`), DNS, IPv6 autoconfig or a static IPv6 (`ipv6_address="2001:db8::10/64"`, read back). |
+| `pt_host_firewall` | Desktop › Firewall | Inbound IPv4/IPv6 firewall on or off. |
+| `pt_web_browser` | Desktop › Web Browser | Open a URL and return the page as text; in UI mode the window's own browser navigates. |
+| `pt_email_client` | Desktop › Email | Configure the account, send, or ask the POP3 server for mail. |
+| `pt_server_dhcp` | Services › DHCP | Create, edit or delete pools (TFTP and WLC options included), exclude ranges, switch the service on/off. |
+| `pt_server_dns` | Services › DNS | Add or remove A and CNAME records, then confirm each one is stored. |
+| `pt_server_http` | Services › HTTP | Replace existing pages (it cannot create new ones), switch HTTP/HTTPS. Refuses to turn either back on or write pages while both are off (PT 9.0.0 crashes); turn one on in the GUI first. |
+| `pt_server_service` | Services › TFTP/FTP/SYSLOG/EMAIL | Toggle the service; FTP users with permissions; email accounts; EMAIL's Domain Name and SMTP/POP3 on/off, read back; SYSLOG's received messages. |
+| `pt_wireless_ap` | AccessPoint-PT Config › Port 1 | SSID, SSID broadcast, MAC filter (allow or deny the listed MACs), applied and read back; resets associations so clients re-associate. No WPA/WEP: the client side has no working profile API. |
+| `pt_read_device_panel` | all tabs, read-only | Model, power, a host's default gateway, per-port IP/MAC/state/IPv6/firewall/bandwidth, which server services are on. |
+
+### Headless or UI mode
+
+| Tool | What it does |
+|------|--------------|
+| `pt_ui_mode` | `headless` (default: nothing opens) or `ui` (every tool above also opens the device window on the matching tab/app). Persists across restarts; `PT_MCP_UI_MODE` overrides it. |
+| `pt_ui_open` | Open a device window on a tab (`CLI`, `Desktop`, `Services`, `Config`…), Desktop app (`command_prompt`, `web_browser`, `email`…) or section (`DHCP`, `FastEthernet0`…). |
+| `pt_ui_capture` | Save a PNG of a device window (or the main window), even when it is covered. Returns the path. |
+| `pt_ui_close` | Close one device window, or all of them. |
+
+Each panel tool also takes `show=True/False` for a single call (it wins over the
+mode) and `capture=True` to save a PNG once it is done. `output_dir` is a folder
+relative to the project root, as with `pt_screenshot`. Claude Code exposes the
+prompts `/mcp__packet-tracer__ui_on`, `ui_off` and `ui_status`.
+
+!!! note "UI mode needs Windows and the `[ui]` extra"
+    Windows are opened through Windows UI Automation and a click *posted* to the
+    canvas (the real cursor does not move), and captured with `PrintWindow`.
+    Install with `pip install "packet-tracer-mcp[ui]"` (adds `comtypes`). Headless
+    mode works everywhere.
+
+!!! warning "What PT 9.0.1 does not let an extension do"
+    PC Wireless profiles, so WPA/WEP on a client (the API throws `invalid vector
+    subscript` on every call), the Text Editor and IoT programs as files (no
+    usable file API) and individual host-firewall rules. Open the window with `pt_ui_open`
+    and set those by hand.
+
+## NAT & ACL
+
+| Tool | What it does |
+|------|--------------|
+| `pt_apply_nat` | Apply NAT/PAT (`static` / `dynamic` / `pat`) on a live router. |
+| `pt_remove_nat` | Remove a NAT/PAT configuration. |
+| `pt_apply_acl` | Build, validate and apply a standard/extended/named ACL via CLI. |
+| `pt_apply_acl_object` | Same, via PT's ACL object API (faster, fewer modal popups). |
+| `pt_remove_acl` | Remove an ACL (and unbind it) via CLI. |
+| `pt_remove_acl_object` | Remove an ACL via the object API. |
+
+## Switching, security & tuning
+
+| Tool | What it does |
+|------|--------------|
+| `pt_apply_vlan` | VLANs, access ports, trunks + router `.1q` subinterfaces (inter-VLAN routing). |
+| `pt_apply_stp` | Spanning-tree mode, root primary, per-VLAN priority, portfast, BPDU guard. |
+| `pt_apply_port_security` | Port-security: max MACs, sticky/static MACs, violation action. |
+| `pt_apply_hardening` | hostname, banner, enable secret, local users, SSH (RSA keys + vty), password-encryption. |
+| `pt_apply_interface_tuning` | Serial clock-rate (DCE), bandwidth, per-interface OSPF/EIGRP knobs. |
+| `pt_apply_etherchannel` | Bundle 2-8 switch ports into Port-channel<n> (LACP, PAgP or static), optionally as a trunk. |
+| `pt_apply_hsrp` | One HSRP group on a router interface: virtual IP, priority, preempt (version 2). |
+| `pt_apply_bgp` | `router bgp`: neighbors with their remote AS and advertised networks (CIDR). |
+| `pt_apply_qos` | class-maps (DSCP / NBAR protocol), a policy-map with priority or bandwidth per class and fair-queue on class-default, attached outbound. |
+| `pt_apply_voice` | Cisco CME on a **2811**: `telephony-service`, one `ephone-dn` per extension, DHCP `option 150`, optional voice VLAN, then restarts the IP phones so they register. |
+
+All accept `dry_run=True` to preview the generated CLI without touching PT, and
+report which IOS lines were rejected.
+
+!!! note "CME voice needs a 2811"
+    Measured end to end on PT 9.0.1: a 2811, a 3560-24PS (PoE) and two 7960 phones
+    cabled on their `Switch` port got their leases and showed `REGISTERED` in
+    `show ephone`. A 2911 rejects `telephony-service` even with the uck9 license and a
+    reload. A phone's address lives on its `Vlan1`.
+
+## Server services
+
+| Tool | What it does |
+|------|--------------|
+| `pt_configure_dhcp_server` | Create, edit or remove a DHCP pool on a **Server-PT** (the GUI's Services > DHCP) and switch the service on or off — network, mask, gateway, DNS, start IP, max users — then read every pool back. Without `network` it only reads. |
+
+!!! note "Router DHCP and server DHCP are two different things"
+    A router's pool is IOS CLI (`ip dhcp pool`), which is what `dhcp=True` in the
+    planner emits. A Server-PT has no CLI: its pools live behind
+    `getProcess("DhcpServerMain").getDhcpServerProcessByPortName("FastEthernet0")`,
+    one level below where it looks — `DhcpServerMain` itself has no pool methods.
+
+    Give the server a static IP inside the pool's subnet first. Packet Tracer never
+    leases the server's own address, but it **will** lease the gateway's if the
+    range covers it, so start the range after the router. And if you name your own
+    pool, the factory `serverPool` adapts itself to the server's subnet and starts
+    leasing from `.1` — the tool deletes it while it is still unconfigured
+    (`drop_factory_pool=True`).
+
+    Changing a pool does not move hosts that already hold a lease, even one now
+    outside the range: run `ipconfig /release` and `ipconfig /renew` on them.
+
+## Verification
+
+| Tool | What it does |
+|------|--------------|
+| `pt_diff` | Compare a plan vs the live topology (missing/extra devices, IP mismatches). |
+| `pt_health_check` | Sweep the live topology: down links, cabled-without-IP, duplicate IPs. |
+| `pt_verify_connectivity` | Run a **real ping** from a device's console and parse the result (reachable or not). |
+
+## Live-state inspection
+
+These read the **device**, not the plan — useful to confirm a change landed, or to
+understand a topology you didn't build. Verified against PT 9.0.0.0810; the readers from
+`pt_read_routes` down were checked on PT 9.0 against the matching `show` commands.
+
+| Tool | What it does |
+|------|--------------|
+| `pt_audit_security` | Security posture of every IOS device, graded high/medium/low: missing `enable secret`, reversibly-stored credentials (type 7), `service password-encryption` off, no local users, no MOTD banner, config-register left at `0x2142`. |
+| `pt_inspect_ports` | Per-port line/protocol status, MAC, IP, duplex, bandwidth, MTU, delay, CDP, DHCP-client, NAT mode, applied ACLs, the real cable type and the far end. Flags cabled-but-down and line-up-protocol-down. |
+| `pt_read_vlans` | The switch's real VLAN database, separating your VLANs from PT's factory ones (1, 1002-1005), with each VLAN's access ports, the trunk ports and their native VLAN, the ports with port security, and access ports left in a VLAN missing from the database. |
+| `pt_read_routes` | The real routing table (what `show ip route` shows): prefix, protocol (C, L, S, O, D, R), next hop, interface, AD and metric. Across routers it lists `convergence_gaps`: prefixes a router running a dynamic protocol lacks while the others know them. |
+| `pt_read_ospf` | OSPF per process: router-id, areas and neighbours with state by name (FULL, 2WAY, INIT...), DR/BDR role, local port and address. Flags neighbours not FULL, duplicate router-ids and routers with OSPF but no neighbours. |
+| `pt_read_arp` | The ARP table (IP, MAC, port) of a router or host. |
+| `pt_read_cdp` | The CDP neighbour table: device id, local and remote port, platform, capability. CDP announces every 60 s, so it is empty right after a deploy. |
+| `pt_read_stp` | Spanning Tree per switch and VLAN: whether it is the root and the root ID. Flags VLANs where switches disagree on the root. PT 9 exposes no per-port STP state or role. |
+| `pt_read_acl` | Each ACL on a router with its commands, and which ports apply which ACL in which direction. Flags ports that reference a missing ACL. |
+| `pt_read_nat` | The NAT translation table, NAT counters (inside source lists, statics, pools) and the inside/outside interfaces. Flags NAT without both an inside and an outside interface. |
+| `pt_read_mac_table` | A switch's MAC address table per VLAN: MAC, port, dynamic or static. |
+| `pt_read_dhcp_leases` | The real DHCP leases per pool: IP, MAC, port, lease time. Router pools from `DhcpServerProcess` (measured); a Server-PT pool whose leases cannot be read says `lease_api: false`. |
+| `pt_device_power` | Power a device off/on with read-back — simulate an outage, or force a reboot so a router rereads its startup-config. |
+
+## Canvas: capture & annotations
+
+Turn a topology into something you can hand to a class. The agent stops
+describing the network and starts showing it.
+
+| Tool | What it does |
+|------|--------------|
+| `pt_screenshot` | Capture the logical canvas to an image file and return its path. |
+| `pt_add_note` | Write a text note on the canvas — label a subnet, name a trunk. |
+| `pt_clear_annotations` | Remove notes and drawings. Never touches devices or links. |
+
+!!! tip "Self-documenting topologies"
+    Combine them: build with `pt_full_build`, label each subnet and link with
+    `pt_add_note`, then `pt_screenshot`. The result is a diagram ready for a
+    slide, produced from one prompt.
+
+!!! warning "There is no drawing tool"
+    Packet Tracer can draw lines and circles on the canvas, but not usefully
+    from an extension: the size argument turned out to control stacking order
+    rather than radius or thickness — three circles asking for 60, 60 and 300
+    all came out the same tiny size — and the colour arguments do not produce
+    the colour requested. Rather than ship parameters that don't do what they
+    say, annotation is limited to text notes.
+
+!!! note "The screenshot returns a path, not the image"
+    A capture runs to tens of thousands of bytes. Returning it inline would fill
+    the model's context with data nobody can look at, so the file is written to
+    disk and only its path comes back. PNG is the default because it compresses a
+    line diagram far better than JPG — measured on the same canvas, 33 KB versus
+    105 KB.
+
+## Backup & workspace
+
+| Tool | What it does |
+|------|--------------|
+| `pt_backup_config` | The device's real startup-config — the one it rereads on reboot — plus serial, config-register, boot images and uptime. `include_xml=True` adds the full device dump. |
+| `pt_project_metadata` | The open project's saved filename, the PT version that wrote it, its description and the device/link count. Pass `description` to set it. |
+| `pt_workspace_options` | Read or toggle workspace behaviour: auto-cabling, access to the **real** network, and the canvas labels that decide whether a screenshot is readable. |
+
+!!! tip "Turn auto-cabling off before a scripted build"
+    With auto-cabling on, Packet Tracer picks the cable and the port for you. If
+    you want a link on an exact interface, `pt_workspace_options(auto_cabling=0)`
+    first.
+
+## Telemetry & QoS
+
+| Tool | What it does |
+|------|--------------|
+| `pt_apply_netflow` | Create, reconfigure or remove a NetFlow exporter on a router — collector address, UDP port, version, source interface, monitors — and read the result back. Exported flows cannot be read. |
+| `pt_read_qos` | Read the device's real class-maps and policy-maps: per policy-map each class with its name, priority, bandwidth, fair-queue and class-default. PT gives a class no name, so names come from the running-config. |
+
+!!! note "NetFlow is configured natively; QoS through IOS CLI"
+    These two look symmetric but are not. `pt_apply_netflow` configures the
+    exporter directly and verifies the result — no CLI involved. QoS, by
+    contrast, can be **read** but not created through the object API, so class-maps
+    and policy-maps are authored through IOS CLI with `pt_apply_qos` and
+    `pt_read_qos` is how you confirm it landed.
+
+## Simulation
+
+Packet Tracer's Simulation mode holds packets in an event list instead of moving
+them in real time, which is what makes a step-by-step trace possible.
+
+| Tool | What it does |
+|------|--------------|
+| `pt_simulation_mode` | Switch between Realtime and Simulation. |
+| `pt_simulation_step` | Advance, rewind or reset the simulation (`forward` / `back` / `reset`). |
+| `pt_read_packet_trace` | Read the event list: per frame the device, ingress/egress port, source, destination, traffic type and outcome — **plus PT's own per-OSI-layer explanation** of what the device decided and why. |
+| `pt_send_pdu` | The GUI's *Add Simple PDU*: an ICMP echo between two devices. In Simulation it waits in the event list; with `steps > 0` it is stepped and the trace comes back in the same reply. |
+| `pt_fast_forward` | Realtime's *Fast Forward Time*: STP converges at once, so a link cabled moments ago answers a ping right away. The deploy and `pt_verify_connectivity` already use it. |
+
+!!! tip "`pt_read_packet_trace` answers *why*, not just *what*"
+    The decision log is the same text Packet Tracer shows in its **PDU Details**
+    pane. A failing ping stops being "no reply" and becomes a cause:
+
+    ```
+    L3 :: The destination IP address is in the same subnet. The device sets the next-hop to destination.
+    L2 :: The next-hop IP address is not in the ARP table. The ARP process tries to
+          send an ARP request for that IP address and buffers this packet.
+    ```
+
+!!! tip "`pt_send_pdu` is the GUI's *Add Simple PDU*"
+    It calls the same `addSimplePdu(source, destination)` the button does (0 = added,
+    30 = the destination does not exist; any other code is returned as is). The
+    first PDU between two devices can die at a router waiting on ARP, exactly like
+    the first ping: send it again. `pt_verify_connectivity` remains the way to run a
+    real ping from a device's console.
+
+!!! warning "`pt_audit_security` never returns credentials"
+    Passwords and hashes do not leave the device. The reader classifies each
+    credential by its prefix and transmits only the algorithm label (`md5`,
+    `type7`, `scrypt`, …) — enough to audit, without putting a hash into the LLM's
+    context or the MCP client's logs.
+
+!!! tip "Build flags"
+    `pt_plan_topology` / `pt_full_build` accept `vlans` (router-on-a-stick VLAN count),
+    `dual_stack` (IPv6: routers via CLI + hosts via SLAAC), `ipv6_base`, and
+    `wireless_laptops` (Laptop-PT → wireless NIC + auto-associated Access Point).
+
+!!! note "Cable types for `pt_add_link`"
+    Valid: `straight`, `cross`, `serial`, `fiber`, `console`, `roll`, `phone`,
+    `coaxial`, `auto`, `usb`. Aliases: `crossover`→`cross`, `rollover`→`roll`.
+    Omit `cable_type` to infer it from the device categories.

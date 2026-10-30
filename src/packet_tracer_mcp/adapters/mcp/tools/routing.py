@@ -1,0 +1,194 @@
+"""Router features sent as IOS CLI, each line verified: HSRP, BGP, QoS (MQC) and CME voice."""
+
+from __future__ import annotations
+
+import json
+
+from mcp.server.fastmcp import FastMCP
+from ....application.use_cases.apply_router_features import (
+    apply_hsrp_uc, apply_bgp_uc, apply_qos_uc, build_bgp_config, build_qos_config,
+)
+from ....application.use_cases.apply_voice import apply_voice_uc, build_voice_config
+from ....infrastructure.generator.voice_cli_generator import restart_ip_phones_js
+from ....domain.models.router_features import HsrpConfig
+from ....infrastructure.execution.ios_verify import IosApplyCheck
+from ..bridge_context import BridgeContext
+from .switching import apply_reply, invalid_input_reply
+from ....shared.utils import reply_json
+
+
+def register(mcp: FastMCP, ctx: BridgeContext) -> None:
+    """Register this module's tools on `mcp`."""
+    _pick_channel = ctx.pick_channel
+    _bridge_send_and_wait = ctx.send_and_wait
+    _query_pt_devices = ctx.live_devices
+
+    def _apply(uc, cfg, label: str, dry_run: bool) -> str:
+        bridge_ok = _pick_channel() != ""
+        check = IosApplyCheck(_bridge_send_and_wait)
+        result = uc(
+            cfg,
+            query_pt_topology=_query_pt_devices if bridge_ok else None,
+            bridge_send=check.send if bridge_ok and not dry_run else None,
+            dry_run=dry_run,
+        )
+        return apply_reply(result, label, bridge_ok, dry_run, check)
+
+    @mcp.tool()
+    def pt_apply_hsrp(
+        router: str,
+        interface: str,
+        group: int,
+        virtual_ip: str,
+        priority: int = 100,
+        preempt: bool = True,
+        version: int = 2,
+        dry_run: bool = False,
+    ) -> str:
+        """
+        Configures one HSRP group on a router interface through IOS CLI, each line verified
+        (`standby version`, `standby <g> ip|priority|preempt`). Measured on a 2911 in PT 9.
+
+        - router / interface: e.g. "R1", "GigabitEthernet0/0" (pt_query_topology).
+        - group: 0-4095 with version 2. Both routers use the same group and virtual_ip.
+        - virtual_ip: the hosts' gateway. With PT connected it must be a free host address
+          in the interface's live subnet, not the interface's own IP.
+        - priority: 0-255, default 100; the higher one becomes active.
+        - preempt: take over again when this router comes back (default True).
+        - version: 2 (measured). 1 is accepted but NOT verified.
+        - dry_run: validate and return the CLI/payload without sending.
+
+        Example (active router; repeat on R2 with priority=100):
+          pt_apply_hsrp(router="R1", interface="GigabitEthernet0/0", group=1,
+                        virtual_ip="192.168.1.254", priority=110)
+        Check: pt_cli(device="R1", commands=["show standby brief"]).
+        """
+        try:
+            cfg = HsrpConfig(router=router, interface=interface, group=group,
+                             virtual_ip=virtual_ip, priority=priority,
+                             preempt=preempt, version=version)
+        except ValueError as exc:
+            return invalid_input_reply("HSRP", exc)
+        return _apply(apply_hsrp_uc, cfg, f"HSRP group {group}", dry_run)
+
+    @mcp.tool()
+    def pt_apply_bgp(
+        router: str,
+        asn: int,
+        neighbors: list[dict] | None = None,
+        networks: list[str] | None = None,
+        dry_run: bool = False,
+    ) -> str:
+        """
+        Configures BGP on a router through IOS CLI, each line verified (`router bgp`,
+        `neighbor <ip> remote-as`, `network <net> mask <mask>`). Measured on a 2911 in PT 9.
+
+        - router: router name in PT.
+        - asn: local AS, 1-65535 (4-byte ASNs were not measured).
+        - neighbors: [{"ip": "10.0.0.2", "remote_as": 65002}]; remote_as == asn is iBGP.
+          With PT connected, a neighbor off every connected subnet is a warning.
+        - networks: CIDR list, host bits zero, e.g. ["192.168.1.0/24"]. BGP only advertises
+          a network that is in the routing table with that exact mask. `show running-config`
+          prints a classful one without `mask`.
+        - dry_run: validate and return the CLI/payload without sending.
+
+        Example: pt_apply_bgp(router="R1", asn=65001,
+          neighbors=[{"ip": "10.0.0.2", "remote_as": 65002}], networks=["192.168.1.0/24"])
+        Check: pt_cli(device="R1", commands=["show ip bgp summary"]).
+        """
+        try:
+            cfg = build_bgp_config(router, asn, neighbors, networks)
+        except (ValueError, TypeError) as exc:
+            return invalid_input_reply("BGP", exc)
+        return _apply(apply_bgp_uc, cfg, f"BGP AS {asn}", dry_run)
+
+    @mcp.tool()
+    def pt_apply_qos(
+        router: str,
+        interface: str,
+        policy_name: str,
+        classes: list[dict],
+        direction: str = "output",
+        dry_run: bool = False,
+    ) -> str:
+        """
+        Configures QoS (MQC) on a router through IOS CLI, each line verified: one
+        `class-map match-any` per class, a `policy-map` whose class-default gets
+        `fair-queue`, and `service-policy output` on the interface. Measured on a 2911.
+
+        - router / interface: e.g. "R1", "GigabitEthernet0/1" (the WAN side).
+        - policy_name: one word, e.g. "WAN-OUT".
+        - classes: [{"name", "match_dscp"?, "match_protocol"?, "priority_kbps"|"bandwidth_kbps"}].
+          At least one match per class (both = match-any); exactly one action.
+          Measured: match_protocol "rtp", match_dscp "ef", priority_kbps. Other DSCP values,
+          other protocols and bandwidth_kbps are accepted but NOT verified (warning).
+        - direction: "output" only (queuing actions are outbound in IOS).
+        - dry_run: validate and return the CLI/payload without sending.
+
+        Example: pt_apply_qos(router="R1", interface="GigabitEthernet0/1", policy_name="WAN-OUT",
+          classes=[{"name": "VOICE", "match_protocol": "rtp", "match_dscp": "ef",
+                    "priority_kbps": 512}])
+        Check: pt_read_qos(device="R1").
+        """
+        try:
+            cfg = build_qos_config(router, interface, policy_name, classes, direction)
+        except (ValueError, TypeError) as exc:
+            return invalid_input_reply("QoS", exc)
+        return _apply(apply_qos_uc, cfg, f"QoS policy '{policy_name}'", dry_run)
+
+    @mcp.tool()
+    def pt_apply_voice(
+        router: str,
+        source_ip: str,
+        extensions: list,
+        max_ephones: int = 5,
+        max_dn: int = 5,
+        auto_assign: bool = True,
+        voice_vlan: int | None = None,
+        switch: str | None = None,
+        access_ports: list[str] | None = None,
+        dhcp_pool: str | None = None,
+        dhcp_network: str | None = None,
+        restart_phones: bool = True,
+        dry_run: bool = False,
+    ) -> str:
+        """
+        Cisco CME voice (IP phones) through IOS CLI, each line verified. The router MUST be
+        a 2811 (PT's 2911 rejects `telephony-service` even with the uck9 license).
+        Measured end to end on PT 9 (2811 + 3560-24PS + two 7960): CME, DHCP option 150
+        and real registration (`show ephone`: REGISTERED). Not measured: ephone + mac,
+        switchport voice vlan (the reply warns).
+
+        - source_ip: the router's IP on the phones' LAN (checked against PT).
+        - extensions: ["1001", "1002"] or [{"number": "1001", "mac"?: "0001.4321.ABCD"}].
+        - max_ephones 1-36, max_dn 1-144. auto_assign: `auto assign 1 to N`.
+        - voice_vlan + switch + access_ports: `switchport voice vlan` on those ports.
+        - dhcp_pool: `option 150 ip <source_ip>`; dhcp_network ("10.10.10.0/24") also sets
+          network + default-router.
+        - restart_phones: power-cycle every IP phone, then fast-forward (default True);
+          phones already on keep 0.0.0.0 otherwise.
+        - dry_run: validate and return the CLI/payload without sending.
+
+        Example: pt_apply_voice(router="R1", source_ip="10.10.10.1", extensions=["1001","1002"],
+          dhcp_pool="VOICE", dhcp_network="10.10.10.0/24")
+        Check: pt_cli(device="R1", commands=["show ephone"]).
+        """
+        try:
+            cfg = build_voice_config(
+                router, source_ip, extensions, max_ephones=max_ephones, max_dn=max_dn,
+                auto_assign=auto_assign, voice_vlan=voice_vlan, switch=switch,
+                access_ports=access_ports, dhcp_pool=dhcp_pool, dhcp_network=dhcp_network)
+        except (ValueError, TypeError) as exc:
+            return invalid_input_reply("CME voice", exc)
+        reply = _apply(apply_voice_uc, cfg, f"CME voice on {router}", dry_run)
+        if dry_run or not restart_phones or _pick_channel() == "":
+            return reply
+        data = json.loads(reply)
+        if not data.get("sent"):
+            return reply
+        raw = _bridge_send_and_wait(restart_ip_phones_js(), timeout=15.0)
+        try:
+            data["phones"] = json.loads(raw) if raw else {"error": "no answer from PT"}
+        except ValueError:
+            data["phones"] = {"error": f"unreadable reply: {raw[:120]}"}
+        return reply_json(data)
